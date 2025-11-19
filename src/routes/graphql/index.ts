@@ -13,8 +13,11 @@ import {
   GraphQLSchema,
   GraphQLString,
   GraphQLEnumType,
+  parse,
+  validate,
   GraphQLInputObjectType,
 } from 'graphql';
+import depthLimit from 'graphql-depth-limit';
 
 const plugin: FastifyPluginAsyncTypebox = async (fastify) => {
   const { prisma } = fastify;
@@ -28,7 +31,13 @@ const plugin: FastifyPluginAsyncTypebox = async (fastify) => {
         200: gqlResponseSchema,
       },
     },
-    async handler(req) {
+    async handler(req, res) {
+
+      const document = parse(req.body.query);
+
+      const errors = validate(schema, document, [depthLimit(5)]);
+      if (errors.length > 0) return res.status(400).send({ errors });
+
       return graphql({
         schema,
         source: req.body.query,
