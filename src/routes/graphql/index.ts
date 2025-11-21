@@ -16,8 +16,11 @@ import {
   parse,
   validate,
   GraphQLInputObjectType,
+  type GraphQLResolveInfo,
 } from 'graphql';
 import depthLimit from 'graphql-depth-limit';
+import DataLoader from 'dataloader';
+import { parseResolveInfo, type ResolveTree } from 'graphql-parse-resolve-info';
 
 const plugin: FastifyPluginAsyncTypebox = async (fastify) => {
   const { prisma } = fastify;
@@ -37,6 +40,78 @@ const plugin: FastifyPluginAsyncTypebox = async (fastify) => {
 
       const errors = validate(schema, document, [depthLimit(5)]);
       if (errors.length > 0) return res.status(400).send({ errors });
+
+      // attach loaders to prisma and also raw query string for resolver fallbacks
+      // eslint-disable-next-line no-console
+      console.error('DEBUG RAW GQL QUERY:', req.body.query);
+      (prisma as any).__gqlQuery = req.body.query;
+
+      (prisma as any).loaders = {
+
+        posts: new DataLoader(async (authorIds) => {
+          const rows = await prisma.post.findMany({
+            where: { authorId: { in: authorIds as string[] } },
+          });
+          return authorIds.map(id => rows.filter(r => r.authorId === id));
+        }),
+
+        profiles: new DataLoader(async (userIds) => {
+          const profiles = await prisma.profile.findMany({
+            where: { userId: { in: userIds as string[] } },
+            select: { id: true, isMale: true, yearOfBirth: true, userId: true, memberTypeId: true },
+          });
+          const memberTypeIds = profiles.map(p => p.memberTypeId);
+          const memberTypes = await prisma.memberType.findMany({
+            where: { id: { in: memberTypeIds } }
+          });
+          return userIds.map(id => {
+            const profile = profiles.find(p => p.userId === id);
+            if (!profile) return null;
+            return {
+              id: profile.id,
+              isMale: profile.isMale,
+              yearOfBirth: profile.yearOfBirth,
+              memberType: memberTypes.find(mType => mType?.id === profile.memberTypeId)
+            };
+          });
+        }),
+        userSubscribedTo: new DataLoader<string, any[]>(async (subscriberIds) => {
+          const rows = await prisma.subscribersOnAuthors.findMany({
+            where: { subscriberId: { in: subscriberIds as string[] } },
+            include: {
+              author: {
+                include: {
+                  profile: { include: { memberType: true } },
+                  posts: true,
+                }
+              }
+            },
+          });
+          return subscriberIds.map(id =>
+            rows
+              .filter(r => r.subscriberId === id)
+              .map(r => r.author)
+          );
+        }),
+        subscribedToUser: new DataLoader<string, any[]>(async (authorIds) => {
+          const rows = await prisma.subscribersOnAuthors.findMany({
+            where: { authorId: { in: authorIds as string[] } },
+            include: {
+              subscriber: {
+                include: {
+                  profile: { include: { memberType: true } },
+                  posts: true,
+                }
+              }
+            },
+          });
+          return authorIds.map(id =>
+            rows
+              .filter(r => r.authorId === id)
+              .map(r => r.subscriber)
+          );
+        }),
+      };
 
       return graphql({
         schema,
@@ -133,47 +208,32 @@ const users = new GraphQLObjectType({
     id: { type: GraphQLString },
     name: { type: GraphQLString },
     balance: { type: GraphQLFloat },
-    profile: { type: profiles },
-    posts: { type: new GraphQLList(posts) },
-
+    profile: {
+      type: profiles,
+      resolve: async (user, _, prisma) =>
+        prisma.loaders.profiles.load(user.id)
+    },
+    posts: {
+      type: new GraphQLList(posts),
+      resolve: async (user, _, prisma) =>
+        prisma.loaders.posts.load(user.id)
+    },
     userSubscribedTo: {
       type: new GraphQLList(users),
-      resolve: async (data, _, prisma) => {
-        const relations = await prisma.subscribersOnAuthors.findMany({
-          where: { subscriberId: data.id },
-          include: { author: true },
-        });
-
-        return relations.map(r => ({
-          ...r.author,
-          subscribedToUser: async () => {
-            const nestedRelations = await prisma.subscribersOnAuthors.findMany({
-              where: { authorId: r.author.id },
-              include: { subscriber: true },
-            });
-            return nestedRelations.map(nr => nr.subscriber);
-          }
-        }));
+      resolve: async (user, _, prisma) => {
+        if (Array.isArray((user as any).userSubscribedTo)) {
+          return (user as any).userSubscribedTo;
+        }
+        return prisma.loaders.userSubscribedTo.load(user.id);
       }
     },
     subscribedToUser: {
       type: new GraphQLList(users),
-      resolve: async (data, _, prisma) => {
-        const relations = await prisma.subscribersOnAuthors.findMany({
-          where: { authorId: data.id },
-          include: { subscriber: true },
-        });
-
-        return relations.map(r => ({
-          ...r.subscriber,
-          userSubscribedTo: async () => {
-            const nestedRelations = await prisma.subscribersOnAuthors.findMany({
-              where: { subscriberId: r.subscriber.id },
-              include: { author: true },
-            });
-            return nestedRelations.map(nr => nr.author);
-          }
-        }));
+      resolve: async (user, _, prisma) => {
+        if (Array.isArray((user as any).subscribedToUser)) {
+          return (user as any).subscribedToUser;
+        }
+        return prisma.loaders.subscribedToUser.load(user.id);
       }
     },
   })
@@ -262,33 +322,71 @@ const schema = new GraphQLSchema({
       users: {
         type: new GraphQLList(users),
         description: 'Return all users',
-        resolve: async (_, __, prisma) => await prisma.user.findMany({
-          include: {
-            profile: {
-              include: { memberType: true }
-            },
-            posts: true,
+        resolve: async (_, __, prisma, info: GraphQLResolveInfo) => {
+          try {
+            const parsed = parseResolveInfo(info) as ResolveTree;
+            const userFields = (parsed.fieldsByTypeName.User || parsed.fieldsByTypeName.users || {}) as Record<string, ResolveTree>;
+
+            const onlyId = (field: ResolveTree | undefined) => {
+              if (!field) return false;
+              const subFields = field.fieldsByTypeName.User || field.fieldsByTypeName.users || {};
+              const fieldNames = Object.keys(subFields);
+              return fieldNames.length === 1 && fieldNames[0] === 'id';
+            };
+
+            const wantsUserSubscribedTo = 'userSubscribedTo' in userFields;
+            const wantsSubscribedToUser = 'subscribedToUser' in userFields;
+
+            if (wantsUserSubscribedTo || wantsSubscribedToUser) {
+              const include: any = {};
+              if (wantsUserSubscribedTo) {
+                if (onlyId(userFields.userSubscribedTo)) {
+                  include.userSubscribedTo = true;
+                } else {
+                  include.userSubscribedTo = { include: { author: { include: { profile: { include: { memberType: true } }, posts: true } } } };
+                }
+              }
+              if (wantsSubscribedToUser) {
+                if (onlyId(userFields.subscribedToUser)) {
+                  include.subscribedToUser = true;
+                } else {
+                  include.subscribedToUser = { include: { subscriber: { include: { profile: { include: { memberType: true } }, posts: true } } } };
+                }
+              }
+              console.error('DEBUG prisma.user.findMany include =>', JSON.stringify(include));
+
+              const usersResult = await prisma.user.findMany({ include });
+
+              if (include.userSubscribedTo === true) {
+                for (const u of usersResult) {
+                  if (Array.isArray((u as any).userSubscribedTo)) {
+                    (u as any).userSubscribedTo = (u as any).userSubscribedTo.map((rel: any) => ({ id: rel.authorId }));
+                  }
+                }
+              }
+              if (include.subscribedToUser === true) {
+                for (const u of usersResult) {
+                  if (Array.isArray((u as any).subscribedToUser)) {
+                    (u as any).subscribedToUser = (u as any).subscribedToUser.map((rel: any) => ({ id: rel.subscriberId }));
+                  }
+                }
+              }
+
+              return usersResult;
+            }
+          } catch (e) {
+            // fallback to basic findMany if parsing fails
           }
-        })
+
+          return await prisma.user.findMany();
+        }
       },
       user: {
         type: users,
         args: {
           id: { type: new GraphQLNonNull(UUID) }
         },
-        resolve: async (_, { id }, prisma) => await prisma.user.findUnique({ where: { id },
-          include: {
-            profile: {
-              include: { memberType: true }
-            },
-            posts: true,
-            userSubscribedTo: {
-              include: { subscriber: true }
-            },
-            subscribedToUser: {
-              include: { author: true }
-            },
-          }})
+        resolve: async (_, { id }, prisma) => await prisma.user.findUnique({ where: { id } })
       },
       profiles: {
         type: new GraphQLList(profiles),
